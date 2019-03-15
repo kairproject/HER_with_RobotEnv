@@ -3,6 +3,7 @@ import sys
 import os
 import rospy
 import numpy as np
+import rospkg
 # reads open manipulator's state
 from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import JointState, Image
@@ -16,6 +17,7 @@ import cv2
 from cv_bridge import CvBridge, CvBridgeError
 from string import Template
 import time
+from random import *
 from ddpg.msg import GoalObs
 from geometry_msgs.msg import (
     PoseStamped,
@@ -23,13 +25,20 @@ from geometry_msgs.msg import (
     Point,
     Quaternion,
 )
+
+from gazebo_msgs.srv import (
+    SetModelState,
+    GetModelState,
+    SpawnModel,
+    DeleteModel,
+)
+
 from gazebo_msgs.srv import (
     GetModelState
 )
-from get_model_gazebo_pose import GazeboModel
 base_dir = os.path.dirname(os.path.realpath(__file__))
 
-fixed_orientation = Quaternion(
+overhead_orientation = Quaternion(
                          x=-0.00142460053167,
                          y=0.999994209902,
                          z=-0.00177030764765,
@@ -53,19 +62,17 @@ OBS_DIM = (100,100,3)      # POMDP
 STATE_DIM = 24        # MDP
  
 class robotEnv(): 
-    def __init__(self, max_steps=700, isdagger=False, isPOMDP=False, train_indicator=0):
+    def __init__(self, max_steps=700, isdagger=False, isPOMDP=False, isreal=False, train_indicator=0):
         """An implementation of OpenAI-Gym style robot reacher environment
         TODO: add method that receives target object's pose as state
         """
         rospy.init_node("robotEnv")
         # for compatiability
-        self.action_space = spaces.Box(-1., 1., shape=(ACTION_DIM,), dtype='float32')
-        self.observation_space = spaces.Dict(dict(
-            observation=spaces.Box(-np.inf, np.inf, shape=obs['observation'].shape, dtype='float32'),
-        ))
+
         self.train_indicator = train_indicator # 0: Train 1:Test
         self.isdagger = isdagger
         self.isPOMDP = isPOMDP
+        self.isreal = isreal
         self.currentDist = 1
         self.previousDist = 1
         self.reached = False
@@ -82,14 +89,6 @@ class robotEnv():
         self.reward_rescale = 1.0
         self.isDemo = False
         self.reward_type = 'sparse'
-        # instantiate dynamixel controller
-        try:
-            self.dxl_pos = DynamixelPositionControl()
-            rospy.loginfo("Dynamixel position controller has been instantiated")
-        except rospy.ROSInterruptException:
-            pass
-        self.joint_command = JointCommand()
-        self.gripper =  intera_interface.Gripper("right")
     
         self.pub_gripper_position = rospy.Publisher('/open_manipulator/gripper_position/command', Float64, queue_size=1)
         self.pub_gripper_sub_position = rospy.Publisher('/open_manipulator/gripper_sub_position/command', Float64, queue_size=1)
@@ -113,21 +112,22 @@ class robotEnv():
         self.joint_efforts = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         # ee pose of robot -> used to compute reward.
-        self.gripper_position = KinematicsPose().pose.position  # [x, y, z] cartesian position
-        self.gripper_orientiation = KinematicsPose().pose.orientation  # [x, y, z, w] quaternion orientation
+        self.gripper_position = [0.0,0.0,0.0]  # [x, y, z] cartesian position
+        self.gripper_orientiation = [0.0,0.0,0.0, 0.0]  # [x, y, z, w] quaternion orientation
         self.distance_threshold = 0.1
 
         # used for per-step elapsed time measurement
         self.tic = 0.0
         self.toc = 0.0
         self.elapsed = 0.0  
-        self.initial_state = self.get_joints_states().copy()
+        # self.initial_state = self.get_joints_states().copy()
         self._action_scale = 1.0
 
         #open manipulator statets
         self.moving_state = ""
         self.actuator_state = ""
-
+        self.init_robot_pose()
+        rospy.on_shutdown(self._delete_target_block)
     
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -155,8 +155,10 @@ class robotEnv():
         Argument: msg
         """        
         self.kinematics_pose = msg
-        self.gripper_position = self.kinematics_pose.pose.position
-        self.gripper_orientiation = self.kinematics_pose.pose.orientation
+        _gripper_position = self.kinematics_pose.pose.position
+        self.gripper_position = [_gripper_position.x, _gripper_position.y, _gripper_position.z]
+        _gripper_orientiation = self.kinematics_pose.pose.orientation
+        self.gripper_orientiation = [_gripper_orientiation.x, _gripper_orientiation.y, _gripper_orientiation.z, _gripper_orientiation.w]
 
     # get and set function
     # ----------------------------
@@ -165,7 +167,7 @@ class robotEnv():
         """Returns current joints states of robot including position, velocity, effort
         Returns: Float64[] self.joints_position, self.joints_velocity, self.joint_effort
         """
-        return self.joints_position, self.joints_velocity, self.joint_effort
+        return self.joint_positions, self.joint_velocities, self.joint_efforts
 
     def get_gripper_pose(self):
         """Returns gripper end effector position
@@ -180,23 +182,21 @@ class robotEnv():
         return self.gripper_position
 
     def set_joints_position(self, joints_angles):
+
         """Move joints using joint position command publishers.
         
         Argument: joints_position_cmd
         self.joints_position_cmd = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         """
-        rate = rospy.Rate(10) # 10hz 
-        while not rospy.is_shutdown():
-            rospy.loginfo(self.joints_position)
-            self.pub_gripper_position.publish(self.joints_position[0])
-            self.pub_gripper_sub_position.publish(self.joints_position[1])
-            self.pub_joint1_position.publish(self.joints_position[2])
-            self.pub_joint2_position.publish(self.joints_position[3])
-            self.pub_joint3_position.publish(self.joints_position[4])
-            self.pub_joint4_position.publish(self.joints_position[5])            
-            rate.sleep()
+        # rospy.loginfo(joints_angles)
+        self.pub_gripper_position.publish(joints_angles[0])
+        self.pub_gripper_sub_position.publish(joints_angles[1])
+        self.pub_joint1_position.publish(joints_angles[2])
+        self.pub_joint2_position.publish(joints_angles[3])
+        self.pub_joint3_position.publish(joints_angles[4])
+        self.pub_joint4_position.publish(joints_angles[5])            
 
-    def step(self, action):#overriden function
+    def step(self, action=np.array([1, 1, 1, 1, 1, 1]), step=0):#overriden function
         """
         Function executed each time step.
         Here we get the action execute it in a time step and retrieve the
@@ -210,21 +210,21 @@ class robotEnv():
         self.done = False
         if step == self.max_steps:
             self.done = True
-
         act = action.flatten().tolist()
         self.set_joints_position(act)
-        if not self.is_real:
-            self.reward = self.compute_reward()
-            if self.check_for_termination():
+        curDist =  self._get_dist()
+        if not self.isreal:
+            self.reward = self._compute_reward()
+            if self._check_for_termination():
                 print ('======================================================')
                 print ('Terminates current Episode : OUT OF BOUNDARY')
                 print ('======================================================')
                 self.done = True
-        _joint_Pos, _joint_vels, _joint_effos = self.get_joints_states()
+        _joint_pos, _joint_vels, _joint_effos = self.get_joints_states()
         # obj_pos = self._get_target_obj_obs() # TODO: implement this function call.                        
 
         if np.mod(step, 10)==0:
-            if not isReal:
+            if not self.isreal:
                 print("DISTANCE : ", curDist)
             print("PER STEP ELAPSED : ", self.elapsed)
             print("SPARSE REWARD : ", self.reward_rescale * self.reward)
@@ -242,9 +242,10 @@ class robotEnv():
         # In this case, we just keep randomizing until we eventually achieve a valid initial
         # configuration.
         did_reset_sim = False
-        while not did_reset_sim:
-            did_reset_sim = self._reset_gazebo_world()
-        obs = self._get_obs()
+        self._reset_gazebo_world()
+        _joint_pos, _joint_vels, _joint_effos = self.get_joints_states()
+        obs = np.array([_joint_pos, _joint_vels, _joint_effos])
+       
         return obs
 
     def _check_robot_moving(self):
@@ -259,13 +260,33 @@ class robotEnv():
         """
         Method that randomly initialize the state of robot agent and surrounding envs (including target obj.)
         """
+        self._delete_target_block()
+
+        self.pub_gripper_position.publish(np.random.uniform(0.0, 0.1)) 
+        self.pub_joint1_position.publish(np.random.uniform(-0.1, 0.1)) 
+        self.pub_joint2_position.publish(np.random.uniform(-0.1, 0.1)) 
+        self.pub_joint3_position.publish(np.random.uniform(-0.1, 0.1)) 
+        self.pub_joint4_position.publish(np.random.uniform(-0.1, 0.1))
+        self._load_target_block()
+
+    def init_robot_pose(self):
         self.pub_gripper_position.publish(np.random.uniform(0.0, 0.1)) 
         self.pub_joint1_position.publish(np.random.uniform(-0.1, 0.1)) 
         self.pub_joint2_position.publish(np.random.uniform(-0.1, 0.1)) 
         self.pub_joint3_position.publish(np.random.uniform(-0.1, 0.1)) 
         self.pub_joint4_position.publish(np.random.uniform(-0.1, 0.1)) 
-        _load_target_block()
-        return _check_robot_moving()
+        self._load_target_block()
+
+    def _delete_target_block(self):
+        # This will be called on ROS Exit, deleting Gazebo models
+        # Do not wait for the Gazebo Delete Model service, since
+        # Gazebo should already be running. If the service is not
+        # available since Gazebo has been killed, it is fine to error out
+        try:
+            delete_model = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
+            resp_delete = delete_model("block")
+        except rospy.ServiceException, e:
+            rospy.loginfo("Delete Model service call failed: {0}".format(e))
 
     def _load_target_block(block_pose=Pose(position=Point(x=0.6725, y=0.1265, z=0.7825)),
                         block_reference_frame="world"):
@@ -299,7 +320,8 @@ class robotEnv():
         """
         Check if the agent has reached undesirable state. If so, terminate the episode early. 
         """
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        pass
 
     def _check_for_success(self):
         """
@@ -321,7 +343,7 @@ class robotEnv():
         try:
             object_state_srv = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
             object_state = object_state_srv("block", "world")
-            self._obj_pose = np.array([object_state.pose.position.x, object_state.pose.position.y, object_state.pose.position.z + DIST_OFFSET])
+            self._obj_pose = np.array([object_state.pose.position.x, object_state.pose.position.y, object_state.pose.position.z])
         except rospy.ServiceException as e:
             rospy.logerr("Spawn URDF service call failed: {0}".format(e))        
         _ee_pose = np.array(self.gripper_position) # FK state of robot
